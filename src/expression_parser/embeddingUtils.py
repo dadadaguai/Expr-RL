@@ -1,10 +1,74 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.nn.functional import cosine_similarity
 from sympy import *
-from data.预编码的AST列表 import get_ast_library, encode_ast
-from parser import encode
+import os
+import pickle
+
+
+huffman_code_dict = {
+    'AccumulationBounds': '01001110100111',
+    'Add': '1100',
+    'ComplexInfinity': '01001111',
+    'Exp1': '010011100',
+    'Float': '0100111010010',
+    'Half': '10011',
+    'ImaginaryUnit': '0100111011',
+    'Infinity': '01001110100000',
+    'Integer': '1110',
+    'Mul': '101',
+    'NaN': '01001110101',
+    'NegativeOne': '1101',
+    'One': '111100',
+    'Pi': '10010',
+    'Pow': '011',
+    'Rational': '010010',
+    'Symbol': '00',
+    'Zero': '0100110',
+    'acos': '01000',
+    'asin': '111110',
+    'asinh': '01001110100001',
+    'atan': '01010',
+    'atanh': '0100111010001',
+    'cos': '111111',
+    'exp': '10001',
+    'log': '10000',
+    'sin': '01011',
+    'sinh': '01001110100110',
+    'tan': '111101'
+}
+
+class HuffmanEmbedding(nn.Module):
+    def __init__(self, huffman_code_dict, embedding_dim):
+        super().__init__()
+        self.huffman_code_dict = huffman_code_dict
+        self.embedding_dim = embedding_dim
+        # 创建可训练的嵌入层，每个字符（'0'或'1'）都有一个嵌入向量
+        self.bit_embedding = nn.Embedding(2, embedding_dim // 2)  # 每个bit用embedding_dim//2维表示
+        self.projection = nn.Linear(embedding_dim // 2 * max(len(code) for code in huffman_code_dict.values()),
+                                    embedding_dim)
+
+    def forward(self, huffman_code):
+        # 将哈夫曼编码字符串转换为bit序列
+        bits = [int(bit) for bit in huffman_code]
+        bits_tensor = torch.tensor(bits, dtype=torch.long).to(self.bit_embedding.weight.device)  # 确保张量在正确设备上
+
+        # 获取每个bit的嵌入
+        bit_embeddings = self.bit_embedding(bits_tensor)
+
+        # 如果编码长度不足最大长度，填充零
+        max_len = max(len(code) for code in self.huffman_code_dict.values())
+        if len(bits) < max_len:
+            padding = torch.zeros(max_len - len(bits), self.embedding_dim // 2,
+                                  device=self.bit_embedding.weight.device)  # 确保填充张量在正确设备上
+            bit_embeddings = torch.cat([bit_embeddings, padding], dim=0)
+
+        # 展平并投影到最终嵌入维度
+        flattened = bit_embeddings.view(-1)
+        return self.projection(flattened)
+
 
 class NaryTreeLSTMCell(nn.Module):
     def __init__(self, input_dim, hidden_dim):
@@ -41,150 +105,122 @@ class NaryTreeLSTMCell(nn.Module):
 
 
 class TreeLSTM(nn.Module):
-    def __init__(self, huffman_code_to_index, embedding_dim, hidden_dim):
+    def __init__(self, huffman_code_dict, embedding_dim, hidden_dim):
         super().__init__()
-        self.huffman_code_to_index = huffman_code_to_index
-        self.vocab_size = len(huffman_code_to_index)
-        self.embedding = nn.Embedding(self.vocab_size, embedding_dim)
+        self.huffman_embedding = HuffmanEmbedding(huffman_code_dict, embedding_dim)
         self.lstm_cell = NaryTreeLSTMCell(embedding_dim, hidden_dim)
 
-    def forward(self, ast):
+    def forward(self, huffman_ast):
         device = next(self.parameters()).device  # 获取模型所在设备
 
         def _traverse(node):
-            node_type, children = node
-            index = torch.tensor(self.huffman_code_to_index[node_type], device=device)
-            x = self.embedding(index).squeeze(0)
-            if not children:  # 叶子节点
+            huffman_code, children = node
+            x = self.huffman_embedding(huffman_code)
+
+            # 检查是否是 Integer 节点（哈夫曼编码为 '1110'）
+            if huffman_code == '1110' and isinstance(children, int):
+                # 如果是 Integer 节点，且 children 是整数，则视为叶子节点
                 return self.lstm_cell(x, [])
-            else:  # 内部节点
+            elif not children or isinstance(children, int):
+                # 其他叶子节点或无效结构
+                return self.lstm_cell(x, [])
+            else:
+                # 正常内部节点
                 children_states = [_traverse(child) for child in children]
                 return self.lstm_cell(x, children_states)
 
-        h_root, _ = _traverse(ast)
+        h_root, _ = _traverse(huffman_ast)
         return h_root
 
+
 class ASTSimilarity(nn.Module):
-    def __init__(self, huffman_code_to_index, embedding_dim, hidden_dim):
+    def __init__(self, huffman_code_dict, embedding_dim, hidden_dim):
         super().__init__()
-        self.tree_lstm = TreeLSTM(huffman_code_to_index, embedding_dim, hidden_dim)
+        self.tree_lstm = TreeLSTM(huffman_code_dict, embedding_dim, hidden_dim)
 
     def forward(self, ast1, ast2):
         h1 = self.tree_lstm(ast1)
         h2 = self.tree_lstm(ast2)
         return cosine_similarity(h1.unsqueeze(0), h2.unsqueeze(0))
 
-# vocab_size = len(vocab)
-# # 初始化模型
-# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-# model = ASTSimilarity(vocab_size, 64, 128).to(device)
-# optimizer = optim.Adam(model.parameters(), lr=0.001)
-#
-#
-# # 保存模型权重
-# torch.save(model.state_dict(), 'ast_similarity_model.pth')
 
-def get_ast_embedding():
+def get_embedding(huffman_ast):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # 假设 vocab_size 已知，这里需要根据实际情况设置
-    import pickle
-    # 读取词汇表
-    with open('vocab.pkl', 'rb') as f:
-        vocab = pickle.load(f)
-    print(vocab)
-    # 读取哈夫曼编码
-    # with open('huffman_code.pkl', 'rb') as f:
-    #     huffman_code = pickle.load(f)
-    size = len(vocab)  # 示例值，根据你的词汇表大小调整
-    # vocab = {sym: i for i, (sym, code) in enumerate(huffman_code)}
     # 初始化模型
-    model = ASTSimilarity(size, 64, 128).to(device)
+    model = ASTSimilarity(huffman_code_dict, 64, 128).to(device)
+
     # 加载模型权重
-    model.load_state_dict(torch.load('ast_similarity_model.pth', map_location=device))
-    ast_code = encode("(x / (x + 1))")
-    embeddings = model.tree_lstm()
-    print(embeddings)
-    return embeddings
-    # embedding, asts = precompute_embeddings(model, pre_encoded_asts)
-
-    print(embeddings)
-def precompute_embeddings(model, pre_encoded_asts, device='cuda'):
-    """
-    预计算所有AST的嵌入向量
-    :param vocab: 符号到索引的映射表
-    :param device: 计算设备
-    :return: 嵌入向量矩阵 [num_asts, hidden_dim], 对应的AST列表
-    """
-    model.eval()
-    model.to(device)
-
-    # 编码AST并存储向量
-    ast_vectors = []
-    valid_asts = []
-    for ast_encoded in pre_encoded_asts:
-        with torch.no_grad():
-            vector = model.tree_lstm(ast_encoded).to('cpu')  # 向量计算并移到CPU
-            ast_vectors.append(vector)
-            valid_asts.append(ast_encoded)
-
-    return torch.stack(ast_vectors), valid_asts
-
-def get_ast_encoder(ast):
-    import pickle
-
-    # 读取词汇表
-    with open('vocab.pkl', 'rb') as f:
-        vocab = pickle.load(f)
-    ast_encode = encode_ast(ast, vocab)
-    return ast_encode
-
-def expression_to_ast_with_symbols(expression):
-    """
-    将表达式转换为包含符号类型的 AST 节点信息。
-    返回的是一个以 (节点类型, 子节点) 形式构成的嵌套结构。
-    """
-    expr = sympify(expression)
-
-    def build_ast(node):
-        if isinstance(node, Basic):
-            return (type(node).__name__, [build_ast(arg) for arg in node.args])
-        else:
-            return repr(node)  # 如果不是SymPy类型，直接返回其表示
-
-    return build_ast(expr)
+    # huffman_ast = ('101', [('00', []), ('011', [('1100', [('1110', 1), ('00', [])]), ('1110', -1)])])
+    # model.load_state_dict(torch.load('ast_similarity_model.pth', map_location=device))
+    embedding = model.tree_lstm(huffman_ast)
+    return embedding
 
 
+def save_embeddings(expr, embedding, path_em='embeddings.pt', path_kv='em_expr.pickle'):
+    embedding_cpu = embedding.cpu()  # 确保张量在CPU上
+
+    # 保存嵌入向量到 .pt 文件
+    if os.path.exists(path_em):
+        existing_embeddings = torch.load(path_em).cpu()  # 确保现有的嵌入向量在CPU上
+        new_embeddings = torch.cat((existing_embeddings, embedding_cpu.unsqueeze(0)), dim=0)
+        torch.save(new_embeddings, path_em)
+    else:
+        torch.save(embedding_cpu.unsqueeze(0), path_em)
+
+    # 保存（嵌入向量，表达式）作为键值对到 .pickle 文件
+    kv_pair = (str(embedding_cpu.detach().numpy().tolist()), expr)
+    print(kv_pair)
+    if os.path.exists(path_kv):
+        with open(path_kv, 'rb') as file:
+            existing_kv = pickle.load(file)
+        # 检查键是否已存在，如果不存在则追加
+        if kv_pair[0] not in existing_kv:
+            existing_kv[kv_pair[0]] = kv_pair[1]  # 使用新的键值对更新字典
+
+    else:
+        existing_kv = {kv_pair[0]: kv_pair[1]}  # 初始化一个新的字典来保存键值对
+    with open(path_kv, 'wb') as file:
+        pickle.dump(existing_kv, file)
+
+def load_embeddings(path_em='embeddings.pt'):
+    if os.path.exists(path_em):
+        existing_embeddings = torch.load(path_em).cpu()
+        # 如果需要一维数组，可以在这里使用 .squeeze(0)
+        return existing_embeddings.squeeze(0) if existing_embeddings.dim() == 2 and existing_embeddings.size(
+            0) == 1 else existing_embeddings
+
+
+def load_embeddings_expr(path_em='em_expr.npy'):
+    pass
+
+# 根据嵌入向量返回expr,用于经验库的匹配
+def get_expr_from_pkl(embedding,path_kv='em_expr.pickle'):
+    # 加载pickle文件中的字典
+    if os.path.exists(path_kv):
+        with open(path_kv, 'rb') as file:
+            kv_dict = pickle.load(file)
+    else:
+        return None  # 如果文件不存在，返回 None
+    k_embedding = str(embedding.detach().numpy().tolist())
+    if k_embedding not in kv_dict:
+        return None
+    expr = kv_dict[k_embedding]
+    return expr
 
 if __name__ == '__main__':
-    get_ast_embedding()
-# 加载模型权重
-#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-#     # 假设 vocab_size 已知，这里需要根据实际情况设置
-#     import pickle
-#     # 读取词汇表
-#     with open('vocab.pkl', 'rb') as f:
-#         vocab = pickle.load(f)
-#     print(vocab)
-#     # 读取哈夫曼编码
-#     # with open('huffman_code.pkl', 'rb') as f:
-#     #     huffman_code = pickle.load(f)
-#     size = len(vocab)  # 示例值，根据你的词汇表大小调整
-#     # vocab = {sym: i for i, (sym, code) in enumerate(huffman_code)}
-#     # 初始化模型
-#     model = ASTSimilarity(size, 64, 128).to(device)
-#     # 加载模型权重
-#     model.load_state_dict(torch.load('ast_similarity_model.pth', map_location=device))
-#     pre_encoded_asts = get_ast_library()
-#     embeddings, asts = precompute_embeddings(model, pre_encoded_asts)
-#
-#     print(embeddings)
-#     print(asts)
-#     torch.save(embeddings, 'ast_embeddings.pt')  # 保存向量
-
-    # # 保存词汇表（用于后续编码）
-    # import pickle
-    # with open('vocab.pkl', 'wb') as f:
-    #     pickle.dump(vocab, f)
+    pass
     #
-    # # 可选：保存整个模型结构（不推荐，可能导致兼容性问题）
-    # # torch.save(model, 'full_model.pt')
+    # # 加载模型权重
+    # huffman_ast = ('101', [('00', []), ('011', [('1100', [('1110', 1), ('00', [])]), ('1110', -1)])])
+    # embedding = get_embedding(huffman_ast)
+    # print(embedding)
+    # save_embeddings('(x / (x + 1))', embedding)
+    #
+    # embedding1 = load_embeddings('embeddings.pt')
+    # print(embedding1)
+    # # get_expr_from_pkl(embedding1)
+    # embedding2 = embedding1.to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    # sim = cosine_similarity(embedding, embedding2, dim=1)
+    # print(f"sim: {sim}")
+
+

@@ -6,7 +6,7 @@ from torch.nn.functional import cosine_similarity
 from sympy import *
 import os
 import pickle
-
+from parserUtils import encode
 
 huffman_code_dict = {
     'AccumulationBounds': '01001110100111',
@@ -109,29 +109,36 @@ class TreeLSTM(nn.Module):
         super().__init__()
         self.huffman_embedding = HuffmanEmbedding(huffman_code_dict, embedding_dim)
         self.lstm_cell = NaryTreeLSTMCell(embedding_dim, hidden_dim)
+        self.embedding_dim = embedding_dim
 
     def forward(self, huffman_ast):
-        device = next(self.parameters()).device  # 获取模型所在设备
+        device = next(self.parameters()).device
 
         def _traverse(node):
-            huffman_code, children = node
-            x = self.huffman_embedding(huffman_code)
+            if not isinstance(node, (list, tuple)) or len(node) != 2:
+                # 无效节点，返回零向量
+                return self.lstm_cell(torch.zeros(self.embedding_dim, device=device), [])
 
-            # 检查是否是 Integer 节点（哈夫曼编码为 '1110'）
+            huffman_code, children = node
+
+            # 处理 Rational 节点（children 是 (numerator, denominator)）
+            if huffman_code == '010010' and isinstance(children, tuple):
+                return self.lstm_cell(torch.zeros(self.embedding_dim, device=device), [])
+
+            # 处理 Integer 节点（children 是整数值）
             if huffman_code == '1110' and isinstance(children, int):
-                # 如果是 Integer 节点，且 children 是整数，则视为叶子节点
-                return self.lstm_cell(x, [])
-            elif not children or isinstance(children, int):
-                # 其他叶子节点或无效结构
+                return self.lstm_cell(torch.zeros(self.embedding_dim, device=device), [])
+
+            # 其他节点
+            x = self.huffman_embedding(huffman_code)
+            if not children or isinstance(children, (int, tuple)):
                 return self.lstm_cell(x, [])
             else:
-                # 正常内部节点
                 children_states = [_traverse(child) for child in children]
                 return self.lstm_cell(x, children_states)
 
         h_root, _ = _traverse(huffman_ast)
         return h_root
-
 
 class ASTSimilarity(nn.Module):
     def __init__(self, huffman_code_dict, embedding_dim, hidden_dim):
@@ -143,46 +150,63 @@ class ASTSimilarity(nn.Module):
         h2 = self.tree_lstm(ast2)
         return cosine_similarity(h1.unsqueeze(0), h2.unsqueeze(0))
 
+# 保存模型权重
+def save_model(model, path='../../data/embedding_TreeLSTM_model.pth'):
+    torch.save(model.state_dict(), path)
+    print(f"Model saved to {path}")
+
+def load_model(model_path='../../data/embedding_TreeLSTM_model.pth'):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = ASTSimilarity(huffman_code_dict, 64, 128).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()  # 切换到评估模式
+    return model
+
 
 def get_embedding(huffman_ast):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # 初始化模型
     model = ASTSimilarity(huffman_code_dict, 64, 128).to(device)
 
-    # 加载模型权重
-    # huffman_ast = ('101', [('00', []), ('011', [('1100', [('1110', 1), ('00', [])]), ('1110', -1)])])
-    # model.load_state_dict(torch.load('ast_similarity_model.pth', map_location=device))
-    embedding = model.tree_lstm(huffman_ast)
+    # 加载预训练权重（如果有）
+    if os.path.exists('../data/embedding_TreeLSTM_model.pth'):
+        model.load_state_dict(torch.load('../data/embedding_TreeLSTM_model.pth', map_location=device))
+
+    model.eval()  # 设置为评估模式
+    with torch.no_grad():  # 禁用梯度计算
+        embedding = model.tree_lstm(huffman_ast)
     return embedding
 
 
-def save_embeddings(expr, embedding, path_em='embeddings.pt', path_kv='em_expr.pickle'):
+def save_embeddings(expr, embedding, path_em='../data/embeddings.pt', path_kv='../data/em_expr.pickle'):
     embedding_cpu = embedding.cpu()  # 确保张量在CPU上
-
-    # 保存嵌入向量到 .pt 文件
-    if os.path.exists(path_em):
-        existing_embeddings = torch.load(path_em).cpu()  # 确保现有的嵌入向量在CPU上
-        new_embeddings = torch.cat((existing_embeddings, embedding_cpu.unsqueeze(0)), dim=0)
-        torch.save(new_embeddings, path_em)
-    else:
-        torch.save(embedding_cpu.unsqueeze(0), path_em)
-
     # 保存（嵌入向量，表达式）作为键值对到 .pickle 文件
     kv_pair = (str(embedding_cpu.detach().numpy().tolist()), expr)
-    print(kv_pair)
+    flag = False
     if os.path.exists(path_kv):
         with open(path_kv, 'rb') as file:
             existing_kv = pickle.load(file)
         # 检查键是否已存在，如果不存在则追加
         if kv_pair[0] not in existing_kv:
+            flag = True
             existing_kv[kv_pair[0]] = kv_pair[1]  # 使用新的键值对更新字典
 
     else:
         existing_kv = {kv_pair[0]: kv_pair[1]}  # 初始化一个新的字典来保存键值对
+        flag = True
     with open(path_kv, 'wb') as file:
         pickle.dump(existing_kv, file)
 
-def load_embeddings(path_em='embeddings.pt'):
+    if flag :
+
+        # 保存嵌入向量到 .pt 文件
+        if os.path.exists(path_em):
+            existing_embeddings = torch.load(path_em).cpu()  # 确保现有的嵌入向量在CPU上
+            new_embeddings = torch.cat((existing_embeddings, embedding_cpu.unsqueeze(0)), dim=0)
+            torch.save(new_embeddings, path_em)
+        else:
+            torch.save(embedding_cpu.unsqueeze(0), path_em)
+
+def load_embeddings(path_em='../data/embeddings.pt'):
     if os.path.exists(path_em):
         existing_embeddings = torch.load(path_em).cpu()
         # 如果需要一维数组，可以在这里使用 .squeeze(0)
@@ -194,7 +218,7 @@ def load_embeddings_expr(path_em='em_expr.npy'):
     pass
 
 # 根据嵌入向量返回expr,用于经验库的匹配
-def get_expr_from_pkl(embedding,path_kv='em_expr.pickle'):
+def get_expr_from_pkl(embedding,path_kv='../data/em_expr.pickle'):
     # 加载pickle文件中的字典
     if os.path.exists(path_kv):
         with open(path_kv, 'rb') as file:
@@ -208,15 +232,21 @@ def get_expr_from_pkl(embedding,path_kv='em_expr.pickle'):
     return expr
 
 if __name__ == '__main__':
-    pass
-    #
-    # # 加载模型权重
-    # huffman_ast = ('101', [('00', []), ('011', [('1100', [('1110', 1), ('00', [])]), ('1110', -1)])])
-    # embedding = get_embedding(huffman_ast)
-    # print(embedding)
-    # save_embeddings('(x / (x + 1))', embedding)
-    #
-    # embedding1 = load_embeddings('embeddings.pt')
+    # 加载模型权重
+    expr = "x/(x+1)"
+    huffman_ast = encode(expr)
+    print(huffman_ast)
+    # 初始化模型
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = ASTSimilarity(huffman_code_dict, 64, 128).to(device)
+
+    # 计算嵌入向量（可选：训练后保存）
+    embedding = get_embedding(huffman_ast)
+    save_embeddings(sympify(expr), embedding)
+    print(embedding)
+    # 保存模型权重
+    # save_model(model, path='embedding_TreeLSTM_model.pth')
+    # embedding1 = load_embeddings('../../data/embeddings.pt')
     # print(embedding1)
     # # get_expr_from_pkl(embedding1)
     # embedding2 = embedding1.to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))

@@ -1,6 +1,7 @@
 import torch
 from torch.nn.functional import cosine_similarity
-from embeddingUtils import load_embeddings
+from embeddingUtils import load_embeddings, get_expr_from_pkl, get_embedding
+from parserUtils import encode
 
 
 class ASTSimilarityBatch:
@@ -74,18 +75,70 @@ class ASTSimilarityBatch:
             return self.model.tree_lstm(ast).to(self.device)
 
 
-# 使用示例
-if __name__ == "__main__":
-    # 初始化（只需要嵌入文件）
-    sim_checker = ASTSimilarityBatch(embeddings_path="embeddings.pt")
-    embedding1 = load_embeddings('embeddings.pt').to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
 
-    matches = sim_checker.query(embedding1)
+def get_similarity_exprs(expr_embedding):
+    embeddings_path = "../data/embeddings.pt"
+    import os
+    if os.path.exists(embeddings_path):
+        existing_embeddings = torch.load(embeddings_path)
+    else:
+        print("文件不存在")
+    sim_checker = ASTSimilarityBatch(embeddings_path="../data/embeddings.pt")
+
+    matches = sim_checker.query(expr_embedding)
+    expr_list  = []
 
     print("匹配结果：")
     for idx, emb, score in matches:
         print(f"索引: {idx}, 相似度: {score:.4f}")
         print(f"嵌入向量: {emb[:5]}...")  # 只打印前5维
+        matches_expr =  get_expr_from_pkl(emb)
+        print(f"匹配的表达式: {matches_expr}")
+        expr_list.append(matches_expr)
+    print(expr_list)
+    return expr_list
+
+def test_get_similarity_exprs(expr):
+    ast_huffman = encode(expr)
+    expr_embedding = get_embedding(ast_huffman)
+
+    embeddings_path = "../data/embeddings.pt"
+    import os
+    if os.path.exists(embeddings_path):
+        existing_embeddings = torch.load(embeddings_path)
+    else:
+        print("文件不存在")
+    sim_checker = ASTSimilarityBatch(embeddings_path="../data/embeddings.pt")
+
+    matches = sim_checker.query(expr_embedding)
+    expr_list  = []
+
+    print("匹配结果：")
+    for idx, emb, score in matches:
+        print(f"索引: {idx}, 相似度: {score:.4f}")
+        print(f"嵌入向量: {emb[:5]}...")  # 只打印前5维
+        matches_expr =  get_expr_from_pkl(emb)
+        print(f"匹配的表达式: {matches_expr}")
+        expr_list.append(matches_expr)
+    print(expr_list)
+    return expr_list
+
+# 使用示例
+if __name__ == "__main__":
+    expr = "(x / (x + 1))"
+    get_similarity_exprs(expr)
+    # 初始化（只需要嵌入文件）
+    # sim_checker = ASTSimilarityBatch(embeddings_path="embeddings.pt")
+    # embedding1 = load_embeddings('embeddings.pt').to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    #
+    # matches = sim_checker.query(embedding1)
+    #
+    # print("匹配结果：")
+    # for idx, emb, score in matches:
+    #     print(f"索引: {idx}, 相似度: {score:.4f}")
+    #     print(f"嵌入向量: {emb[:5]}...")  # 只打印前5维
+    #     print(f"匹配的表达式: {get_expr_from_pkl(emb)}")
+
 
     # 示例2：双输入比较
     # emb1 = torch.randn(128)

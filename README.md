@@ -70,11 +70,10 @@ Expr-RL/
 ### 依赖安装
 ```bash
 # 克隆项目
-git clone <项目仓库地址>
+git clone https://github.com/dadadaguai/Expr-RL.git
 cd Expr-RL
 
 # 安装依赖（建议使用虚拟环境）
-pip install -r requirements.txt
 # 核心依赖包括：
 # - sympy: 表达式解析与重写
 # - numpy: 数值计算
